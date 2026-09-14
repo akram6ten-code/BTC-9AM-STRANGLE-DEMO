@@ -1,54 +1,88 @@
 from flask import Flask, jsonify
-import os
-import requests
-import time
+import os, time, hmac, hashlib, requests
 from datetime import datetime
 
 app = Flask(__name__)
 
-# Delta India Demo API
 BASE_URL = "https://api.india.delta.exchange"
-
 API_KEY = os.environ.get("DELTA_API_KEY", "").strip()
 API_SECRET = os.environ.get("DELTA_API_SECRET", "").strip()
 
-def get_btc_price():
-    try:
-        r = requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=5).json()
-        return float(r['result']['close'])
-    except:
-        return 79000
+def get_signature(secret, message):
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
-def get_current_expiry():
-    # Aaj ka date format Delta ke hisab se - DDMMYY
-    # Delta auto current expiry nikal lega
-    # Simple: aaj ka expiry lelo
-    today = datetime.now()
-    return today.strftime("%d%m%y")
+def get_btc_price():
+    r = requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()
+    return float(r['result']['close'])
+
+def place_order(symbol, side):
+    method = "POST"
+    path = "/v2/orders"
+    timestamp = str(int(time.time()))
+    body = {
+        "product_symbol": symbol,
+        "size": 10,  # 10 LOT
+        "side": side,
+        "order_type": "market_order",
+        "time_in_force": "gtc"
+    }
+    import json
+    body_str = json.dumps(body)
+    msg = method + timestamp + path + body_str
+    sign = get_signature(API_SECRET, msg)
+    headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': sign,
+        'Content-Type': 'application/json'
+    }
+    r = requests.post(BASE_URL + path, headers=headers, data=body_str, timeout=10)
+    return r.json()
+
+def get_expiry_symbol():
+    # Daily expiry list se aaj ka expiry nikalna
+    r = requests.get(f"{BASE_URL}/v2/products", timeout=10).json()
+    for p in r['result']:
+        if 'BTC' in p['symbol'] and p['contract_type'] == 'call_options':
+            # Sabse najdeek ka expiry lelo
+            return p['symbol'].split('-')[-1] 
+    return None
 
 @app.route("/")
 def home():
-    return "BTC-9AM STRANGLE DEMO LIVE"
+    return "LIVE - Ready to SELL"
 
 @app.route("/sell")
 def sell():
     try:
-        btc_price = get_btc_price()
-        atm = round(btc_price / 100) * 100
+        btc = get_btc_price()
+        atm = int(round(btc / 100) * 100)
+
+        # Aaj ki expiry - Delta format DD-MM-YY
+        # Agar ye galat ho to Delta ke website se exact format dekh lenge
+        from datetime import timedelta
+        expiry = (datetime.now() + timedelta(days=1)).strftime("%d-%m-%y") 
+        # Demo ke liye try karte hain call list se
+        # Better: direct products API se ATM symbol dhoondhna
         
-        # Abhi ke liye sirf check kar raha hai key sahi hai ya nahi
-        # Order wala part next step me add karenge jab ye deploy ho jaye
-        
+        # ATM symbol try
+        ce_sym = f"C-BTC-{atm}-{expiry}"
+        pe_sym = f"P-BTC-{atm}-{expiry}"
+
+        # Pehle products check karke sahi symbol dhoondh lete hain
+        products = requests.get(f"{BASE_URL}/v2/products", timeout=10).json()['result']
+        ce_real = next((p['symbol'] for p in products if str(atm) in p['symbol'] and 'C-BTC' in p['symbol']), ce_sym)
+        pe_real = next((p['symbol'] for p in products if str(atm) in p['symbol'] and 'P-BTC' in p['symbol']), pe_sym)
+
+        ce_order = place_order(ce_real, 'sell')
+        pe_order = place_order(pe_real, 'sell')
+
         return jsonify({
-            "success": True,
-            "btc_price": btc_price,
+            "btc": btc,
             "atm": atm,
-            "api_key_present": bool(API_KEY),
-            "message": "API Key sahi hai, deploy FIX ho gaya. Ab order logic add karenge",
-            "time": datetime.now().strftime("%d-%m-%Y %I:%M %p")
+            "sold": [ce_real, pe_real],
+            "ce_result": ce_order,
+            "pe_result": pe_order
         })
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+        return jsonify({"error": str(e)}), 500

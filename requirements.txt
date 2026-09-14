@@ -1,4 +1,3 @@
-Flask
+fastapi
+uvicorn
 requests
-gunicorn
-pytz

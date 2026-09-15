@@ -3,28 +3,66 @@ from flask import Flask
 
 app = Flask(__name__)
 
-# Delta India Demo ka sahi URL
-URLS = [
-    "https://cdn-ind.testnet.deltaex.org",
-    "https://cdn-ind-demo.deltaex.org", 
-    "https://api.india.delta.exchange"
-]
+def get_signature(secret, method, timestamp, path, body):
+    signature_data = method + timestamp + path + body
+    return hmac.new(secret.encode(), signature_data.encode(), hashlib.sha256).hexdigest()
 
-def place_order_for_url(base_url, api_key, api_secret):
+@app.route("/")
+def home():
+    return "Bot Live - Delta India Demo"
+
+@app.route("/trigger")
+def trigger():
+    api_key = os.getenv("DELTA_API_KEY","").strip()
+    api_secret = os.getenv("DELTA_API_SECRET","").strip()
+    base_url = os.getenv("DELTA_API_URL","").strip().rstrip('/')
+
+    if not api_key or not api_secret or not base_url:
+        return "Env khali hai - KEY / SECRET / URL check karo"
+
+    # 1. Pehle products list lelo - Demo ka sahi ID pata chalega
+    try:
+        path_prod = "/v2/products"
+        timestamp = str(int(time.time()))
+        sig = get_signature(api_secret, "GET", timestamp, path_prod, "")
+        headers = {'api-key': api_key, 'timestamp': timestamp, 'signature': sig}
+        r = requests.get(base_url + path_prod, headers=headers, timeout=15)
+
+        if r.status_code!= 200:
+            return f"Products fetch fail {base_url} => {r.status_code} {r.text[:500]}"
+
+        products = r.json().get('result', [])
+        # BTC ka koi bhi perpetual dhoondh lo
+        btc_product = None
+        for p in products:
+            if 'BTC' in p.get('symbol','') and 'USD' in p.get('symbol','') and p.get('contract_type') == 'perpetual_futures':
+                btc_product = p
+                break
+        if not btc_product:
+            btc_product = products[0] if products else None
+
+        if not btc_product:
+            return "Koi product nahi mila demo pe"
+
+        prod_id = btc_product['id']
+        prod_sym = btc_product['symbol']
+
+    except Exception as e:
+        return f"Products error: {e}"
+
+    # 2. Ab usi product pe order lagao
     try:
         path = "/v2/orders"
         url = base_url + path
-        # BTC Options ka symbol demo pe
         payload = {
-            "product_id": 1, # BTCUSD - pehle isi pe test karte hain
+            "product_id": prod_id,
             "size": 1,
             "side": "buy",
             "order_type": "market_order"
         }
         body = json.dumps(payload)
         timestamp = str(int(time.time()))
-        signature_data = "POST" + timestamp + path + body
-        signature = hmac.new(api_secret.encode(), signature_data.encode(), hashlib.sha256).hexdigest()
+        signature = get_signature(api_secret, "POST", timestamp, path, body)
         headers = {
             'api-key': api_key,
             'timestamp': timestamp,
@@ -32,29 +70,9 @@ def place_order_for_url(base_url, api_key, api_secret):
             'Content-Type': 'application/json'
         }
         r = requests.post(url, data=body, headers=headers, timeout=10)
-        return r.status_code, r.text
+        return f"Trying {prod_sym} (ID:{prod_id}) on {base_url}<br><br>Status: {r.status_code}<br>{r.text}"
     except Exception as e:
-        return 500, str(e)
-
-@app.route("/")
-def home():
-    return "Bot Live - Demo.delta.exchange Fix Applied"
-
-@app.route("/trigger")
-def trigger():
-    api_key = os.getenv("DELTA_API_KEY","").strip()
-    api_secret = os.getenv("DELTA_API_SECRET","").strip()
-    if not api_key or not api_secret:
-        return "Render me DELTA_API_KEY / SECRET khali hai"
-
-    results = []
-    for base_url in URLS:
-        code, text = place_order_for_url(base_url, api_key, api_secret)
-        results.append(f"{base_url} => {code} {text[:200]}")
-        if code == 200 or code == 201:
-            return f"SUCCESS: Key kaam kar gayi is URL pe: {base_url}<br><br>{text}"
-    
-    return "<br><br>".join(results) + "<br><br>NOTE: demo.delta.exchange ki key sirf cdn-ind.testnet pe kaam karegi - ye wahi check ho rahi hai"
+        return f"Order error: {e}"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

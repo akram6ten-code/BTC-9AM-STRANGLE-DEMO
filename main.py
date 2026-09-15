@@ -1,83 +1,75 @@
-import time, hmac, hashlib, json, requests, datetime, threading
+import time, hmac, hashlib, json, requests, threading
 from fastapi import FastAPI
-from zoneinfo import ZoneInfo # pytz ki zarurat nahi
+from zoneinfo import ZoneInfo
+import datetime
 
-API_KEY = "1vX1L8Q7Jm2K4N9Pq6R3"
-API_SECRET = "i8m3UqX2yZ5aB9cD0eF1gH2jK3lM4nO5pQ6rS7tU8vW9xY0zA1bC2dE3fG4h"
+API_KEY = "TERA_KEY_YAHAN_DAAL"
+API_SECRET = "TERA_SECRET_YAHAN_DAAL"
 BASE_URL = "https://api.india.delta.exchange"
 
 app = FastAPI()
-bot_status = {"running": False, "position": None, "last_check": "Waiting"}
+bot_status = {"last_check": "Idle", "position": None}
 
 def api_call(method, endpoint, payload=None):
-    try:
-        ts = str(int(time.time()))
-        path = f"/v2{endpoint}"
-        body = json.dumps(payload) if payload else ""
-        msg = method + ts + path + body
-        sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-        headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
-        url = f"{BASE_URL}{path}"
-        r = requests.request(method, url, headers=headers, data=body if payload else None, timeout=15)
-        print(f"REQ {endpoint} {payload} -> RESP {r.text[:800]}", flush=True)
-        return r.json()
-    except Exception as e:
-        print(f"API ERROR {e}", flush=True)
-        return {}
+    ts = str(int(time.time()))
+    path = f"/v2{endpoint}"
+    body = json.dumps(payload) if payload else ""
+    msg = method + ts + path + body
+    sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
+    r = requests.request(method, f"{BASE_URL}{path}", headers=headers, data=body if payload else None, timeout=15)
+    print(f"{endpoint} -> {r.text[:1200]}", flush=True)
+    return r.json()
 
 def get_live_expiry():
-    # Delta India: daily expiry, aaj ka ya kal ka jo live ho
     ist = ZoneInfo("Asia/Kolkata")
     now = datetime.datetime.now(ist)
-    for i in range(0, 4):
+    for i in range(5):
         d = (now + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-        res = requests.get(f"{BASE_URL}/v2/products", params={"contract_types":"call_options", "states":"live", "expiry": d}, timeout=10).json()
+        res = requests.get(f"{BASE_URL}/v2/products", params={"contract_types":"call_options,put_options", "states":"live", "expiry": d}, timeout=10).json()
         if res.get('result'):
             return d, res['result']
     return None, []
 
-def get_atm(spot, products):
-    strike = int(round(spot / 1000) * 1000)
+def find_near_100(products, side):
+    best_sym, best_prem, best_diff = None, 0, 9999
     for p in products:
-        if f"-{strike}-" in p['symbol']:
-            return p['symbol'], strike
-    # agar exact ATM na mile to pehla wala le lo
-    return products[0]['symbol'], strike if products else (None, None)
+        if not p['symbol'].startswith(f"{side}-BTC-"): continue
+        try:
+            prem = float(requests.get(f"{BASE_URL}/v2/tickers/{p['symbol']}", timeout=5).json()['result']['mark_price'])
+            diff = abs(prem - 100)
+            if diff < best_diff and prem > 10: # 10 se kam wala illiquid hata diya
+                best_diff = diff
+                best_sym = p['symbol']
+                best_prem = prem
+        except: continue
+    return best_sym, best_prem
 
 def bot_loop():
-    bot_status["running"] = True
-    while bot_status["running"]:
-        try:
-            expiry_date, products = get_live_expiry()
-            if not products:
-                bot_status["last_check"] = "No live expiry"
-                time.sleep(60)
-                continue
+    expiry, products = get_live_expiry()
+    spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
+    print(f"Scanning expiry {expiry} spot {spot}", flush=True)
 
-            spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
-            product_id, atm = get_atm(spot, products)
+    call_sym, call_prem = find_near_100(products, 'C')
+    put_sym, put_prem = find_near_100(products, 'P')
 
-            ticker = requests.get(f"{BASE_URL}/v2/tickers/{product_id}", timeout=10).json().get('result', {})
-            premium = float(ticker.get('mark_price', 0))
+    bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} CALL:{call_sym} ~{call_prem} | PUT:{put_sym} ~{put_prem}"
+    print(bot_status["last_check"], flush=True)
 
-            bot_status["last_check"] = f"Exp:{expiry_date} Spot:{spot} ATM:{atm} Prod:{product_id} Prem:{premium}"
-            print(bot_status["last_check"], flush=True)
+    if call_sym:
+        print(f"SELL CALL {call_sym}", flush=True)
+        api_call("POST", "/orders", {"product_symbol": call_sym, "size": 1, "side": "sell", "order_type": "market_order"})
+        time.sleep(1)
+    if put_sym:
+        print(f"SELL PUT {put_sym}", flush=True)
+        api_call("POST", "/orders", {"product_symbol": put_sym, "size": 1, "side": "sell", "order_type": "market_order"})
 
-            # ---- TERI STRATEGY YAHI LAGEGI (1 MIN) ----
-            # Abhi ke liye sirf check kar raha hai, order tabhi marega jab tu bolega
-            # Example: if premium < supertrend and not bot_status["position"]:
-            # api_call("POST", "/orders", {...})
-
-        except Exception as e:
-            print(f"LOOP ERR {e}", flush=True)
-        time.sleep(60) # 1 minute
+    bot_status["position"] = f"SHORT {call_sym} & {put_sym}"
 
 @app.get("/")
-def home():
-    return {"message": "BTC Bot is live", "status": "running" if bot_status["running"] else "idle", "last_check": bot_status["last_check"], "position": bot_status["position"]}
+def home(): return bot_status
 
 @app.get("/start")
 def start():
-    if not bot_status["running"]:
-        threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=bot_loop, daemon=True).start()
     return {"started": True}

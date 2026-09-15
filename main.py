@@ -2,8 +2,8 @@ import time, hmac, hashlib, json, requests, threading, datetime
 from fastapi import FastAPI
 from zoneinfo import ZoneInfo
 
-API_KEY = "PASTE_YOUR_REAL_DELTA_DEMO_KEY"
-API_SECRET = "PASTE_YOUR_REAL_DELTA_DEMO_SECRET"
+API_KEY = "PASTE_YOUR_REAL_KEY"
+API_SECRET = "PASTE_YOUR_REAL_SECRET"
 BASE_URL = "https://api.india.delta.exchange"
 
 app = FastAPI()
@@ -17,7 +17,7 @@ def api_call(method, endpoint, payload=None):
     sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
     headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
     r = requests.request(method, f"{BASE_URL}{path}", headers=headers, data=body if payload else None, timeout=15)
-    print(f"{endpoint} -> {r.text[:1500]}", flush=True)
+    print(r.text[:1500], flush=True)
     return r.json()
 
 def get_live_expiry():
@@ -33,27 +33,26 @@ def get_live_expiry():
 def bot_loop():
     try:
         expiry, products = get_live_expiry()
-        if not products:
-            bot_status["last_check"] = "No live expiry found"
-            print("No expiry", flush=True)
-            return
+        spot_data = requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()
+        spot = float(spot_data['result'].get('spot_price', 76000))
 
-        spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
-        print(f"Scanning Expiry:{expiry} Spot:{spot} Total Products:{len(products)}", flush=True)
-
-        # Bulk tickers - 1 call me sabka premium
-        tickers = requests.get(f"{BASE_URL}/v2/tickers", timeout=15).json().get('result', [])
-        ticker_map = {t['symbol']: float(t.get('mark_price',0)) for t in tickers}
-
+        tickers = requests.get(f"{BASE_URL}/v2/tickers", params={"contract_types":"call_options,put_options"}, timeout=15).json().get('result', [])
+        
         best_call = None
         best_put = None
         best_c_diff = 9999
         best_p_diff = 9999
 
-        for p in products:
-            sym = p['symbol']
-            prem = ticker_map.get(sym, 0)
-            if prem < 15: continue # illiquid hatao
+        for t in tickers:
+            sym = t.get('symbol','')
+            if expiry not in sym: continue  # sirf current expiry ka le
+            prem_raw = t.get('mark_price')
+            if prem_raw is None: continue
+            try:
+                prem = float(prem_raw)
+            except:
+                continue
+            if prem < 20: continue
             diff = abs(prem - 100)
             if sym.startswith("C-BTC-") and diff < best_c_diff:
                 best_c_diff = diff
@@ -63,33 +62,30 @@ def bot_loop():
                 best_put = (sym, prem)
 
         if not best_call or not best_put:
-            print("Near 100 not found", flush=True)
+            bot_status["last_check"] = f"No near 100 found for {expiry}"
+            print(bot_status["last_check"], flush=True)
             return
 
         call_sym, call_prem = best_call
         put_sym, put_prem = best_put
-
-        bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} | CALL:{call_sym} @ {call_prem} | PUT:{put_sym} @ {put_prem}"
+        bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} | CALL:{call_sym} @{call_prem} | PUT:{put_sym} @{put_prem}"
         print(bot_status["last_check"], flush=True)
 
-        print(f"SELLING CALL {call_sym}", flush=True)
         api_call("POST", "/orders", {"product_symbol": call_sym, "size": 1, "side": "sell", "order_type": "market_order"})
         time.sleep(1)
-        print(f"SELLING PUT {put_sym}", flush=True)
         api_call("POST", "/orders", {"product_symbol": put_sym, "size": 1, "side": "sell", "order_type": "market_order"})
-
+        
         bot_status["position"] = f"SHORT {call_sym} & {put_sym}"
-        print("DONE BOTH SHORT", flush=True)
+        print("DONE", flush=True)
 
     except Exception as e:
         print(f"ERROR {e}", flush=True)
         bot_status["last_check"] = f"Error {e}"
 
 @app.get("/")
-def home():
-    return bot_status
+def home(): return bot_status
 
 @app.get("/start")
 def start():
     threading.Thread(target=bot_loop, daemon=True).start()
-    return {"started": True, "msg": "Scanning near 100 premium"}
+    return {"started": True}

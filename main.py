@@ -33,50 +33,52 @@ def get_live_expiry():
 def bot_loop():
     try:
         expiry, products = get_live_expiry()
-        spot_data = requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()
-        spot = float(spot_data['result'].get('spot_price', 76000))
-
-        tickers = requests.get(f"{BASE_URL}/v2/tickers", params={"contract_types":"call_options,put_options"}, timeout=15).json().get('result', [])
-        
-        best_call = None
-        best_put = None
-        best_c_diff = 9999
-        best_p_diff = 9999
-
-        for t in tickers:
-            sym = t.get('symbol','')
-            if expiry not in sym: continue  # sirf current expiry ka le
-            prem_raw = t.get('mark_price')
-            if prem_raw is None: continue
-            try:
-                prem = float(prem_raw)
-            except:
-                continue
-            if prem < 20: continue
-            diff = abs(prem - 100)
-            if sym.startswith("C-BTC-") and diff < best_c_diff:
-                best_c_diff = diff
-                best_call = (sym, prem)
-            if sym.startswith("P-BTC-") and diff < best_p_diff:
-                best_p_diff = diff
-                best_put = (sym, prem)
-
-        if not best_call or not best_put:
-            bot_status["last_check"] = f"No near 100 found for {expiry}"
-            print(bot_status["last_check"], flush=True)
+        if not products:
+            bot_status["last_check"] = "No expiry"
             return
 
-        call_sym, call_prem = best_call
-        put_sym, put_prem = best_put
-        bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} | CALL:{call_sym} @{call_prem} | PUT:{put_sym} @{put_prem}"
-        print(bot_status["last_check"], flush=True)
+        spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
+        
+        # Sirf is expiry ke product symbols
+        prod_symbols = [p['symbol'] for p in products]
+        # bulk tickers lekin filter nahi karna expiry string se
+        tickers = requests.get(f"{BASE_URL}/v2/tickers", params={"contract_types":"call_options,put_options"}, timeout=20).json().get('result', [])
 
+        best_call = None
+        best_put = None
+        bc_diff = 9999
+        bp_diff = 9999
+
+        for t in tickers:
+            sym = t.get('symbol')
+            if sym not in prod_symbols: continue
+            prem = t.get('mark_price')
+            if prem is None: continue
+            prem = float(prem)
+            if prem < 10: continue # bahut cheap hatao
+            diff = abs(prem - 100)
+            if sym.startswith("C-BTC-") and diff < bc_diff:
+                bc_diff = diff
+                best_call = (sym, prem, diff)
+            if sym.startswith("P-BTC-") and diff < bp_diff:
+                bp_diff = diff
+                best_put = (sym, prem, diff)
+
+        print(f"Found CALL {best_call} PUT {best_put}", flush=True)
+
+        if not best_call or not best_put:
+            bot_status["last_check"] = f"No near 100 for {expiry} total tickers {len(tickers)}"
+            return
+
+        call_sym, call_prem, _ = best_call
+        put_sym, put_prem, _ = best_put
+
+        bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} | CALL:{call_sym} @{call_prem} | PUT:{put_sym} @{put_prem}"
+        
         api_call("POST", "/orders", {"product_symbol": call_sym, "size": 1, "side": "sell", "order_type": "market_order"})
         time.sleep(1)
         api_call("POST", "/orders", {"product_symbol": put_sym, "size": 1, "side": "sell", "order_type": "market_order"})
-        
         bot_status["position"] = f"SHORT {call_sym} & {put_sym}"
-        print("DONE", flush=True)
 
     except Exception as e:
         print(f"ERROR {e}", flush=True)
@@ -84,7 +86,6 @@ def bot_loop():
 
 @app.get("/")
 def home(): return bot_status
-
 @app.get("/start")
 def start():
     threading.Thread(target=bot_loop, daemon=True).start()

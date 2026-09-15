@@ -14,39 +14,39 @@ def trigger():
     ts=str(int(time.time())); path="/v2/products"
     sig=get_sig(api_secret,"GET",ts,path,"")
     headers={'api-key':api_key,'timestamp':ts,'signature':sig}
-
-    try:
-        prods = requests.get(base_url+path, headers=headers, timeout=20).json().get('result',[])
-    except Exception as e:
-        return f"Products API fail {e}"
-
+    prods = requests.get(base_url+path, headers=headers, timeout=20).json().get('result',[])
     btc = next((p for p in prods if p['symbol']=='BTCUSD' and p['contract_type']=='perpetual_futures'), None)
-    if not btc: return "BTCUSD perp nahi mila"
+    if not btc: return "BTCUSD nahi mila"
 
-    # FIX: Candle Public Live Server se lete hain - Demo pe nahi milta
-    # Yahan auth ki zarurat nahi
+    # FINAL FIX: start/end dena zaruri hai
     try:
         public_url = "https://api.india.delta.exchange"
-        candle_path = f"/v2/history/candles?resolution=1m&symbol=MARK:BTCUSD&limit=100"
+        now = int(time.time())
+        start = now - 3600*3 # 3 ghante pehle se
+        end = now
+
+        # 1m ke liye
+        candle_path = f"/v2/history/candles?symbol=MARK:BTCUSD&resolution=1m&start={start}&end={end}"
         r = requests.get(public_url + candle_path, timeout=15).json()
         data = r.get('result', [])
+
         if len(data) < 20:
-            # fallback 15m
-            candle_path = f"/v2/history/candles?resolution=15m&symbol=MARK:BTCUSD&limit=100"
+            # 1m nahi toh 5m try
+            candle_path = f"/v2/history/candles?symbol=MARK:BTCUSD&resolution=5m&start={start}&end={end}"
             r = requests.get(public_url + candle_path, timeout=15).json()
             data = r.get('result', [])
+
     except Exception as e:
         return f"Public Candle API fail {e}"
 
     if len(data) < 20:
-        return f"Candle abhi bhi fail hai len {len(data)} - Resp {str(data)[:200]}"
+        return f"Candle fail len {len(data)} Path {candle_path} Resp {str(data)[:300]}"
 
     closes=[float(c['close']) for c in data]
     highs=[float(c['high']) for c in data]
     lows=[float(c['low']) for c in data]
     vols=[float(c['volume']) for c in data]
 
-    # VWAP
     cum_tpv=0; cum_vol=0
     vwap_list=[]
     for i in range(len(closes)):
@@ -57,12 +57,10 @@ def trigger():
 
     close=closes[-1]
     vwap=vwap_list[-1]
-
     atr = sum([highs[-i]-lows[-i] for i in range(1,11)])/10 if len(highs)>=11 else highs[-1]-lows[-1]
     hl2=(highs[-1]+lows[-1])/2
     upper=hl2+3*atr
     lower=hl2-3*atr
-
     is_up=True
     if close <= lower: is_up=False
     elif close >= upper: is_up=True
@@ -70,10 +68,9 @@ def trigger():
 
     if close < vwap and not is_up: otype="call_options"
     elif close > vwap and is_up: otype="put_options"
-    else: return f"NO TRADE<br>Close {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>Public Candle OK {len(data)} candles"
+    else: return f"NO TRADE Close {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'} Candles {len(data)}"
 
     atm_strike = round(close / 200) * 200
-
     opts=[p for p in prods if p.get('contract_type')==otype and 'BTC' in p['symbol']]
     opts=sorted(opts, key=lambda x: x.get('settlement_time',''))
     if not opts: return f"{otype} nahi mila"
@@ -89,9 +86,9 @@ def trigger():
     h2={'api-key':api_key,'timestamp':ts2,'signature':sig2,'Content-Type':'application/json'}
     ro=requests.post(base_url+path_o, data=body, headers=h2, timeout=15)
 
-    return f"SUCCESS FIXED<br>Spot {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>ATM {atm_strike} Selected {sel['symbol']} Strike {sel['strike_price']}<br>Order {ro.status_code} {ro.text[:500]}"
+    return f"SUCCESS<br>Close {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>ATM {atm_strike} Sel {sel['symbol']}<br>Order {ro.status_code} {ro.text[:500]}"
 
 @app.route("/")
-def home(): return "LIVE - FIXED PUBLIC CANDLE - 1m VWAP+ST"
+def home(): return "LIVE - FIXED WITH START END - 1m"
 
 if __name__ == "__main__": app.run(host="0.0.0.0", port=10000)

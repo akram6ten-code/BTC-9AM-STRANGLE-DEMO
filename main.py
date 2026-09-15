@@ -9,24 +9,16 @@ API_SECRET = os.environ.get("DELTA_API_SECRET", "").strip()
 
 def get_btc_price():
     try:
-        # try 1: BTCUSD ticker
         r = requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()
         if r.get('result') and r['result'].get('mark_price'):
             return float(r['result']['mark_price'])
-
-        # try 2: BTCUSDT or index
-        r2 = requests.get(f"{BASE_URL}/v2/tickers", timeout=10).json()
-        for t in r2.get('result', []):
-            if t['symbol'] == 'BTCUSD' and t.get('mark_price'):
-                return float(t['mark_price'])
-        # fallback
-        return 115000.0
     except:
-        return 115000.0
+        pass
+    return 115000.0 # fallback se kabhi None error nahi ayega
 
 def place_sell():
     if not API_KEY:
-        return "FAIL: Render > Environment me DELTA_API_KEY / SECRET daalo pehle"
+        return "FAIL: Render > Environment me DELTA_API_KEY / SECRET nahi hai. Pehle waha daalo"
 
     try:
         price = get_btc_price()
@@ -36,16 +28,13 @@ def place_sell():
         calls = [p for p in prods if p['contract_type']=='call_options' and p['strike_price']==str(strike) and 'BTC' in p['symbol']]
         puts = [p for p in prods if p['contract_type']=='put_options' and p['strike_price']==str(strike) and 'BTC' in p['symbol']]
 
-        if not calls:
-            # strike nahi mila to nearest strike lo
-            all_strikes = sorted(list(set([int(float(p['strike_price'])) for p in prods if 'BTC' in p['symbol'] and p['contract_type']=='call_options'])))
-            nearest = min(all_strikes, key=lambda x: abs(x - strike))
-            return f"Strike {strike} nahi mila. Nearest available: {nearest}. Code me strike={nearest} karke try karo. Price={price}"
+        if not calls or not puts:
+            return f"Strike {strike} nahi mila is expiry pe. Price={price}"
 
         call = sorted(calls, key=lambda x: x['settlement_time'])[0]
         put = sorted(puts, key=lambda x: x['settlement_time'])[0]
 
-        out = [f"BTC Price: {price} -> ATM Strike: {strike}", f"Call: {call['symbol']} | Put: {put['symbol']}"]
+        out = [f"BTC Price: {price} | Strike: {strike}", f"Call: {call['symbol']}", f"Put: {put['symbol']}"]
 
         for prod in [call, put]:
             ts = str(int(time.time()))
@@ -54,16 +43,15 @@ def place_sell():
             sig = hmac.new(API_SECRET.encode(), (f"POST{ts}/v2/orders{payload}").encode(), hashlib.sha256).hexdigest()
             headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
             r = requests.post(BASE_URL+"/v2/orders", headers=headers, data=payload, timeout=10)
-            out.append(f"{prod['symbol']} SELL => {r.status_code} {r.text[:800]}")
+            out.append(f"SELL {prod['symbol']} => {r.status_code} {r.text[:600]}")
 
         return "\n\n".join(out)
-
     except Exception as e:
         return f"Exception: {e}"
 
 @app.route('/')
 def home():
-    return f"Live. Price check: {get_btc_price()}"
+    return f"Bot Live - Price: {get_btc_price()} - /trigger kholo SELL ke liye"
 
 @app.route('/trigger')
 def trigger():

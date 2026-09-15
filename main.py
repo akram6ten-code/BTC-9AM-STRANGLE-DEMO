@@ -1,10 +1,9 @@
-import time, hmac, hashlib, json, requests, threading
+import time, hmac, hashlib, json, requests, threading, datetime
 from fastapi import FastAPI
 from zoneinfo import ZoneInfo
-import datetime
 
-API_KEY = "TERA_KEY_YAHAN_DAAL"
-API_SECRET = "TERA_SECRET_YAHAN_DAAL"
+API_KEY = "PASTE_YOUR_REAL_DELTA_DEMO_KEY"
+API_SECRET = "PASTE_YOUR_REAL_DELTA_DEMO_SECRET"
 BASE_URL = "https://api.india.delta.exchange"
 
 app = FastAPI()
@@ -18,7 +17,7 @@ def api_call(method, endpoint, payload=None):
     sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
     headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
     r = requests.request(method, f"{BASE_URL}{path}", headers=headers, data=body if payload else None, timeout=15)
-    print(f"{endpoint} -> {r.text[:1200]}", flush=True)
+    print(f"{endpoint} -> {r.text[:1500]}", flush=True)
     return r.json()
 
 def get_live_expiry():
@@ -31,45 +30,66 @@ def get_live_expiry():
             return d, res['result']
     return None, []
 
-def find_near_100(products, side):
-    best_sym, best_prem, best_diff = None, 0, 9999
-    for p in products:
-        if not p['symbol'].startswith(f"{side}-BTC-"): continue
-        try:
-            prem = float(requests.get(f"{BASE_URL}/v2/tickers/{p['symbol']}", timeout=5).json()['result']['mark_price'])
-            diff = abs(prem - 100)
-            if diff < best_diff and prem > 10: # 10 se kam wala illiquid hata diya
-                best_diff = diff
-                best_sym = p['symbol']
-                best_prem = prem
-        except: continue
-    return best_sym, best_prem
-
 def bot_loop():
-    expiry, products = get_live_expiry()
-    spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
-    print(f"Scanning expiry {expiry} spot {spot}", flush=True)
+    try:
+        expiry, products = get_live_expiry()
+        if not products:
+            bot_status["last_check"] = "No live expiry found"
+            print("No expiry", flush=True)
+            return
 
-    call_sym, call_prem = find_near_100(products, 'C')
-    put_sym, put_prem = find_near_100(products, 'P')
+        spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
+        print(f"Scanning Expiry:{expiry} Spot:{spot} Total Products:{len(products)}", flush=True)
 
-    bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} CALL:{call_sym} ~{call_prem} | PUT:{put_sym} ~{put_prem}"
-    print(bot_status["last_check"], flush=True)
+        # Bulk tickers - 1 call me sabka premium
+        tickers = requests.get(f"{BASE_URL}/v2/tickers", timeout=15).json().get('result', [])
+        ticker_map = {t['symbol']: float(t.get('mark_price',0)) for t in tickers}
 
-    if call_sym:
-        print(f"SELL CALL {call_sym}", flush=True)
+        best_call = None
+        best_put = None
+        best_c_diff = 9999
+        best_p_diff = 9999
+
+        for p in products:
+            sym = p['symbol']
+            prem = ticker_map.get(sym, 0)
+            if prem < 15: continue # illiquid hatao
+            diff = abs(prem - 100)
+            if sym.startswith("C-BTC-") and diff < best_c_diff:
+                best_c_diff = diff
+                best_call = (sym, prem)
+            if sym.startswith("P-BTC-") and diff < best_p_diff:
+                best_p_diff = diff
+                best_put = (sym, prem)
+
+        if not best_call or not best_put:
+            print("Near 100 not found", flush=True)
+            return
+
+        call_sym, call_prem = best_call
+        put_sym, put_prem = best_put
+
+        bot_status["last_check"] = f"Exp:{expiry} Spot:{spot} | CALL:{call_sym} @ {call_prem} | PUT:{put_sym} @ {put_prem}"
+        print(bot_status["last_check"], flush=True)
+
+        print(f"SELLING CALL {call_sym}", flush=True)
         api_call("POST", "/orders", {"product_symbol": call_sym, "size": 1, "side": "sell", "order_type": "market_order"})
         time.sleep(1)
-    if put_sym:
-        print(f"SELL PUT {put_sym}", flush=True)
+        print(f"SELLING PUT {put_sym}", flush=True)
         api_call("POST", "/orders", {"product_symbol": put_sym, "size": 1, "side": "sell", "order_type": "market_order"})
 
-    bot_status["position"] = f"SHORT {call_sym} & {put_sym}"
+        bot_status["position"] = f"SHORT {call_sym} & {put_sym}"
+        print("DONE BOTH SHORT", flush=True)
+
+    except Exception as e:
+        print(f"ERROR {e}", flush=True)
+        bot_status["last_check"] = f"Error {e}"
 
 @app.get("/")
-def home(): return bot_status
+def home():
+    return bot_status
 
 @app.get("/start")
 def start():
     threading.Thread(target=bot_loop, daemon=True).start()
-    return {"started": True}
+    return {"started": True, "msg": "Scanning near 100 premium"}

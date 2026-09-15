@@ -1,4 +1,5 @@
-flask
-requests
+fastapi
+uvicorn
 gunicorn
-pytz
+requests
+pandas

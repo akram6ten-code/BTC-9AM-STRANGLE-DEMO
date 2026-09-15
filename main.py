@@ -1,137 +1,83 @@
-import time, hmac, hashlib, requests, json, pandas as pd, threading, os
+import time, hmac, hashlib, json, requests, datetime, threading
 from fastapi import FastAPI
-from datetime import datetime
+from zoneinfo import ZoneInfo # pytz ki zarurat nahi
+
+API_KEY = "1vX1L8Q7Jm2K4N9Pq6R3"
+API_SECRET = "i8m3UqX2yZ5aB9cD0eF1gH2jK3lM4nO5pQ6rS7tU8vW9xY0zA1bC2dE3fG4h"
+BASE_URL = "https://api.india.delta.exchange"
 
 app = FastAPI()
+bot_status = {"running": False, "position": None, "last_check": "Waiting"}
 
-# --- CONFIG - DEMO.DELTA.EXCHANGE ---
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-API_KEY = "vPbT9hNZnAlZwu7ESb1SXh4Ugh64FQ"
-API_SECRET = "rHOasGMfXzrsjtupKY0hRKXT031d09mlPxicu8xyUXouNQWvD9O0xYA6PDmz"
-LEVERAGE = 100
-LOT_SIZE = 50
-TARGET_PCT = 0.90
-SL_PCT = 0.50
-RESOLUTION = "15m"
+def api_call(method, endpoint, payload=None):
+    try:
+        ts = str(int(time.time()))
+        path = f"/v2{endpoint}"
+        body = json.dumps(payload) if payload else ""
+        msg = method + ts + path + body
+        sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        headers = {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
+        url = f"{BASE_URL}{path}"
+        r = requests.request(method, url, headers=headers, data=body if payload else None, timeout=15)
+        print(f"REQ {endpoint} {payload} -> RESP {r.text[:800]}", flush=True)
+        return r.json()
+    except Exception as e:
+        print(f"API ERROR {e}", flush=True)
+        return {}
 
-bot_status = {"status": "idle", "last_check": "", "position": None}
+def get_live_expiry():
+    # Delta India: daily expiry, aaj ka ya kal ka jo live ho
+    ist = ZoneInfo("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
+    for i in range(0, 4):
+        d = (now + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        res = requests.get(f"{BASE_URL}/v2/products", params={"contract_types":"call_options", "states":"live", "expiry": d}, timeout=10).json()
+        if res.get('result'):
+            return d, res['result']
+    return None, []
 
-def get_signature(secret, message):
-    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-def api_call(method, path, query="", payload=""):
-    timestamp = str(int(time.time()))
-    signature_data = method + timestamp + path + query + payload
-    signature = get_signature(API_SECRET, signature_data)
-    headers = {'api-key': API_KEY, 'timestamp': timestamp, 'signature': signature, 'Content-Type': 'application/json'}
-    url = BASE_URL + path + query
-    r = requests.request(method, url, data=payload, headers=headers, timeout=10)
-    return r.json()
-
-def get_atm_call_product():
-    res = requests.get(f"{BASE_URL}/v2/products?contract_types=call_options&underlying_asset_symbols=BTC")
-    products = [p for p in res.json()['result'] if p['state']=='live']
-    products.sort(key=lambda x: x['settlement_time'])
-    current_expiry_time = products[0]['settlement_time']
-    current_expiry_products = [p for p in products if p['settlement_time']==current_expiry_time]
-    spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD").json()['result']['spot_price'])
-    atm_strike = int(round(spot / 100) * 100)
-    atm_call = next((p for p in current_expiry_products if float(p['strike_price'])==atm_strike), None)
-    if not atm_call:
-        atm_call = min(current_expiry_products, key=lambda x: abs(float(x['strike_price'])-atm_strike))
-    print(f"LOCKED: Spot={spot} | ATM Strike={atm_call['strike_price']} | Product={atm_call['symbol']}")
-    return atm_call
-
-def get_supertrend_value(symbol):
-    end = int(time.time())
-    start = end - (200*15*60)
-    r = requests.get(f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution={RESOLUTION}&start={start}&end={end}")
-    candles = r.json()['result']
-    df = pd.DataFrame(candles)
-    df['hl2'] = (df['high'] + df['low'])/2
-    df['tr'] = df['high'] - df['low']
-    period = 10
-    multiplier = 3
-    df['atr'] = df['tr'].rolling(period).mean()
-    df['upperband'] = df['hl2'] + (multiplier * df['atr'])
-    df['lowerband'] = df['hl2'] - (multiplier * df['atr'])
-    df['supertrend'] = 0.0
-    df['in_uptrend'] = True
-    # FIXED:.loc use kiya hai taaki warning aur slow na ho
-    for i in range(1, len(df)):
-        close = df.loc[i, 'close']
-        ub_prev = df.loc[i-1, 'upperband']
-        lb_prev = df.loc[i-1, 'lowerband']
-        if close > ub_prev:
-            df.loc[i, 'in_uptrend'] = True
-        elif close < lb_prev:
-            df.loc[i, 'in_uptrend'] = False
-        else:
-            df.loc[i, 'in_uptrend'] = df.loc[i-1, 'in_uptrend']
-            if df.loc[i, 'in_uptrend'] and df.loc[i, 'lowerband'] < lb_prev:
-                df.loc[i, 'lowerband'] = lb_prev
-            if not df.loc[i, 'in_uptrend'] and df.loc[i, 'upperband'] > ub_prev:
-                df.loc[i, 'upperband'] = ub_prev
-        df.loc[i, 'supertrend'] = df.loc[i, 'lowerband'] if df.loc[i, 'in_uptrend'] else df.loc[i, 'upperband']
-    return float(df.iloc[-1]['supertrend']), float(df.iloc[-1]['close'])
+def get_atm(spot, products):
+    strike = int(round(spot / 1000) * 1000)
+    for p in products:
+        if f"-{strike}-" in p['symbol']:
+            return p['symbol'], strike
+    # agar exact ATM na mile to pehla wala le lo
+    return products[0]['symbol'], strike if products else (None, None)
 
 def bot_loop():
-    global bot_status
-    try:
-        product = get_atm_call_product()
+    bot_status["running"] = True
+    while bot_status["running"]:
         try:
-            api_call("POST", "/v2/products/"+str(product['id'])+"/orders/leverage", payload=json.dumps({"leverage": str(LEVERAGE)}))
-        except: pass
-        position = None
-        entry_price = 0
-        initial_sl = 0
-        trailing_sl = 0
-        bot_status["status"] = "running"
-        print("Bot Started - Waiting for Premium < SuperTrend...")
-        while True:
-            try:
-                ticker = requests.get(f"{BASE_URL}/v2/tickers/{product['symbol']}").json()['result']
-                premium_ltp = float(ticker['mark_price'])
-                st_value, _ = get_supertrend_value(product['symbol'])
-                bot_status["last_check"] = f"Premium {premium_ltp} | ST {st_value} | Pos {position}"
-                if position is None:
-                    if premium_ltp < st_value:
-                        order = api_call("POST", "/v2/orders", payload=json.dumps({"product_id": product['id'], "size": LOT_SIZE, "side": "sell", "order_type": "market_order"}))
-                        position = "SHORT"
-                        entry_price = premium_ltp
-                        initial_sl = entry_price * (1 + SL_PCT)
-                        trailing_sl = initial_sl
-                        bot_status["position"] = f"SHORTED @ {entry_price} SL {initial_sl}"
-                else:
-                    profit = entry_price - premium_ltp
-                    if profit > 0:
-                        new_trail = initial_sl - profit
-                        if new_trail < trailing_sl:
-                            trailing_sl = new_trail
-                    target_price = entry_price * (1 - TARGET_PCT)
-                    if premium_ltp <= target_price or premium_ltp >= trailing_sl:
-                        api_call("POST", "/v2/orders", payload=json.dumps({"product_id": product['id'], "size": LOT_SIZE, "side": "buy", "order_type": "market_order"}))
-                        bot_status["position"] = f"EXITED @ {premium_ltp}"
-                        break
-                time.sleep(5)
-            except Exception as e:
-                print("Error:", e)
-                time.sleep(5)
-    except Exception as e:
-        bot_status["status"] = f"error: {e}"
+            expiry_date, products = get_live_expiry()
+            if not products:
+                bot_status["last_check"] = "No live expiry"
+                time.sleep(60)
+                continue
+
+            spot = float(requests.get(f"{BASE_URL}/v2/tickers/BTCUSD", timeout=10).json()['result']['spot_price'])
+            product_id, atm = get_atm(spot, products)
+
+            ticker = requests.get(f"{BASE_URL}/v2/tickers/{product_id}", timeout=10).json().get('result', {})
+            premium = float(ticker.get('mark_price', 0))
+
+            bot_status["last_check"] = f"Exp:{expiry_date} Spot:{spot} ATM:{atm} Prod:{product_id} Prem:{premium}"
+            print(bot_status["last_check"], flush=True)
+
+            # ---- TERI STRATEGY YAHI LAGEGI (1 MIN) ----
+            # Abhi ke liye sirf check kar raha hai, order tabhi marega jab tu bolega
+            # Example: if premium < supertrend and not bot_status["position"]:
+            # api_call("POST", "/orders", {...})
+
+        except Exception as e:
+            print(f"LOOP ERR {e}", flush=True)
+        time.sleep(60) # 1 minute
 
 @app.get("/")
 def home():
-    return {"message": "BTC Bot is Live", "bot": bot_status}
+    return {"message": "BTC Bot is live", "status": "running" if bot_status["running"] else "idle", "last_check": bot_status["last_check"], "position": bot_status["position"]}
 
 @app.get("/start")
-def start_bot():
-    if bot_status["status"]!= "running":
+def start():
+    if not bot_status["running"]:
         threading.Thread(target=bot_loop, daemon=True).start()
-        return {"started": True}
-    return {"started": False, "msg": "already running"}
-
-# Render ke liye port bind fix
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    return {"started": True}

@@ -5,23 +5,6 @@ app = Flask(__name__)
 def get_sig(s,m,ts,p,b):
     return hmac.new(s.encode(), (m+ts+p+b).encode(), hashlib.sha256).hexdigest()
 
-def get_candles(base_url, headers, btc_id, symbol):
-    # 3 try - Delta kabhi kabhi symbol format change karta hai
-    urls_to_try = [
-        f"/v2/history/candles?resolution=1m&symbol=MARK:{btc_id}&limit=100",
-        f"/v2/history/candles?resolution=1&symbol=MARK:{btc_id}&limit=100",
-        f"/v2/history/candles?resolution=1m&symbol={symbol}&limit=100",
-        f"/v2/history/candles?resolution=15m&symbol=MARK:{btc_id}&limit=100",
-    ]
-    for path in urls_to_try:
-        try:
-            r = requests.get(base_url+path, headers=headers, timeout=15).json()
-            data = r.get('result', [])
-            if len(data) > 20:
-                return data, path
-        except: pass
-    return [], "no data"
-
 @app.route("/trigger")
 def trigger():
     api_key=os.getenv("DELTA_API_KEY","").strip()
@@ -40,16 +23,30 @@ def trigger():
     btc = next((p for p in prods if p['symbol']=='BTCUSD' and p['contract_type']=='perpetual_futures'), None)
     if not btc: return "BTCUSD perp nahi mila"
 
-    data, used_path = get_candles(base_url, headers, btc['id'], btc['symbol'])
+    # FIX: Candle Public Live Server se lete hain - Demo pe nahi milta
+    # Yahan auth ki zarurat nahi
+    try:
+        public_url = "https://api.india.delta.exchange"
+        candle_path = f"/v2/history/candles?resolution=1m&symbol=MARK:BTCUSD&limit=100"
+        r = requests.get(public_url + candle_path, timeout=15).json()
+        data = r.get('result', [])
+        if len(data) < 20:
+            # fallback 15m
+            candle_path = f"/v2/history/candles?resolution=15m&symbol=MARK:BTCUSD&limit=100"
+            r = requests.get(public_url + candle_path, timeout=15).json()
+            data = r.get('result', [])
+    except Exception as e:
+        return f"Public Candle API fail {e}"
 
     if len(data) < 20:
-        return f"Candle fail - 0 data aa raha hai. Used path tried: {used_path} | BTC ID: {btc['id']} | Last Resp: {str(data)[:200]}"
+        return f"Candle abhi bhi fail hai len {len(data)} - Resp {str(data)[:200]}"
 
     closes=[float(c['close']) for c in data]
     highs=[float(c['high']) for c in data]
     lows=[float(c['low']) for c in data]
     vols=[float(c['volume']) for c in data]
 
+    # VWAP
     cum_tpv=0; cum_vol=0
     vwap_list=[]
     for i in range(len(closes)):
@@ -73,7 +70,7 @@ def trigger():
 
     if close < vwap and not is_up: otype="call_options"
     elif close > vwap and is_up: otype="put_options"
-    else: return f"NO TRADE<br>Close {close:.2f} VWAP {vwap:.2f} Supertrend {'GREEN' if is_up else 'RED'}<br>Used Candle: {used_path}<br>Dono condition match nahi hui"
+    else: return f"NO TRADE<br>Close {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>Public Candle OK {len(data)} candles"
 
     atm_strike = round(close / 200) * 200
 
@@ -92,9 +89,9 @@ def trigger():
     h2={'api-key':api_key,'timestamp':ts2,'signature':sig2,'Content-Type':'application/json'}
     ro=requests.post(base_url+path_o, data=body, headers=h2, timeout=15)
 
-    return f"SUCCESS<br>Close {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>Candle Source: {used_path}<br>Selected ATM {sel['symbol']} Strike {sel['strike_price']}<br>Order {ro.status_code} {ro.text[:500]}"
+    return f"SUCCESS FIXED<br>Spot {close:.2f} VWAP {vwap:.2f} ST {'GREEN' if is_up else 'RED'}<br>ATM {atm_strike} Selected {sel['symbol']} Strike {sel['strike_price']}<br>Order {ro.status_code} {ro.text[:500]}"
 
 @app.route("/")
-def home(): return "LIVE - 1m Fixed + Fallback - ATM"
+def home(): return "LIVE - FIXED PUBLIC CANDLE - 1m VWAP+ST"
 
 if __name__ == "__main__": app.run(host="0.0.0.0", port=10000)

@@ -3,8 +3,8 @@ from datetime import datetime
 
 # --- CONFIG - DEMO.DELTA.EXCHANGE ---
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-API_KEY = "DAL DE APNA DEMO KEY"
-API_SECRET = "DAL DE APNA DEMO SECRET"
+API_KEY = "vPbT9hNZnAlZwu7ESb1SXh4Ugh64FQ"
+API_SECRET = "rHOasGMfXzrsjtupKY0hRKXT031d09mlPxicu8xyUXouNQWvD9O0xYA6PDmz"
 LEVERAGE = 100
 LOT_SIZE = 50
 TARGET_PCT = 0.90 # 90% target
